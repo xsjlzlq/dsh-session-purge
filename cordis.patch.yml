@@ -1,0 +1,6 @@
+# Session purge bundle: one Host row (the delete route) whose Client half draws
+# the right-click menu. Both halves live in this package; no other row needed.
+- insert:
+    - id: session-purge
+      name: '@local/dsh-session-purge'
+      config: {}
