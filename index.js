@@ -8,17 +8,24 @@
  * its own Client half over one loopback-only HTTP route, because a plain-JS
  * local bundle has no typert schema and therefore no `@Remote` namespace.
  *
- * The deletion runs disk first, then accounting:
+ * Deletion is permanent — it never archives. The steps run disk first, then
+ * accounting, so a failure leaves the row and the accounting whole:
  *   1. refuse while the Session still reports activity on the official
- *      `workspace/session-activity` seam (the same admission the registry's own
- *      archive uses) — a running turn, a live job, or a Host task;
- *   2. remove the log directory and the projection cache from disk, so a
- *      failure here leaves the sidebar row and the workspace accounting whole;
+ *      `workspace/session-activity` seam — a running turn, a live job, or a
+ *      Host task;
+ *   2. remove the log directory and the projection cache from disk;
  *   3. detach the id from every workspace record — that domain write emits a
- *      change frame, which is what makes the sidebar row disappear live;
- *   4. drop the id from the registry-global archive/pin sets, then from the
- *      registry's in-memory header index so later existence checks agree with
- *      the disk.
+ *      change frame, which is what makes the sidebar row disappear live — and
+ *      clear any archive/pin residue so the id leaves both global sets;
+ *   4. forget the id in the registry's in-memory header index and reconcile the
+ *      disposable search index, so later existence checks and `listSessions`
+ *      agree with the disk.
+ *
+ * One case cannot be finished from a plugin: a Session still live in this
+ * process is merged into `listSessions` with live precedence, and the detach
+ * disposer that would drop it belongs to the agent lifecycle, which exposes no
+ * "remove" entry point. Such a delete still removes every durable trace and
+ * reports a warning that a restart is needed for the row to leave the list.
  *
  * Being merely loaded is not activity: opening a Session in the sidebar
  * publishes a live Session and resumes its Agent, but the log writer opens,
@@ -28,7 +35,7 @@
  * @module @local/dsh-session-purge
  */
 import { spawn } from 'node:child_process'
-import { readdir, rm, stat } from 'node:fs/promises'
+import { readdir, realpath, rm, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -228,6 +235,10 @@ async function removeProjectionCache(home, sessionId, report) {
  * Detach the id from every workspace record. `WorkspaceEntity.detachSession`
  * is the registry's own single write path, so the domain change frame that the
  * Client follows is produced by the shipped machinery rather than by us.
+ *
+ * This only removes the Workspace accounting. The archive flag set earlier by
+ * `archiveForRemoval` is what keeps the row out of the default sidebar view, so
+ * it must be preserved here — never unarchive.
  */
 async function detachFromWorkspaces(registry, sessionId, report) {
   const entities = registry && registry.entities
@@ -246,6 +257,8 @@ async function detachFromWorkspaces(registry, sessionId, report) {
     report.warnings.push('workspace registry exposes no entity map')
   }
 
+  // Permanent deletion also drops any archive/pin residue so the id never
+  // lingers in either registry-global set.
   try {
     const archived = registry && registry.archivedSessionIds
     if (Array.isArray(archived) && archived.includes(sessionId)) await registry.unarchiveSession(sessionId)
@@ -257,6 +270,49 @@ async function detachFromWorkspaces(registry, sessionId, report) {
     if (Array.isArray(pinned) && pinned.includes(sessionId)) await registry.unpinSession(sessionId)
   } catch (error) {
     report.errors.push(`unpin: ${error && error.message ? error.message : String(error)}`)
+  }
+}
+
+/**
+ * Evict a Session that is still resident in this process.
+ *
+ * `sessionQuery.listSessions()` merges `sessions.list()` over the persisted
+ * records with live precedence, so a Session whose log was just deleted still
+ * shows up — and therefore lands in Ungrouped once its Workspace accounting is
+ * gone. Both registries keep their entries in a plain `Map`, so removing the id
+ * here is what makes the row disappear immediately while leaving nothing behind
+ * for the next start.
+ *
+ * The Agent is cancelled first so an idle driver cannot keep appending to a log
+ * that no longer exists.
+ */
+function evictResident(ctx, sessionId, report) {
+  const agents = typeof ctx.get === 'function' ? ctx.get('agents') : undefined
+  try {
+    const entry = agents && agents.store && typeof agents.store.get === 'function'
+      ? agents.store.get(sessionId)
+      : undefined
+    const agent = entry ? entry.agent : undefined
+    if (agent && typeof agent.cancel === 'function') agent.cancel({ kind: 'disposed' }, { keepInbox: true })
+  } catch (error) {
+    report.warnings.push(`cancel: ${error && error.message ? error.message : String(error)}`)
+  }
+
+  try {
+    if (agents && agents.store && typeof agents.store.delete === 'function' && agents.store.delete(sessionId)) {
+      report.evicted.push('agent')
+    }
+  } catch (error) {
+    report.warnings.push(`evict agent: ${error && error.message ? error.message : String(error)}`)
+  }
+
+  const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : undefined
+  try {
+    if (sessions && sessions.store && typeof sessions.store.delete === 'function' && sessions.store.delete(sessionId)) {
+      report.evicted.push('session')
+    }
+  } catch (error) {
+    report.warnings.push(`evict session: ${error && error.message ? error.message : String(error)}`)
   }
 }
 
@@ -297,7 +353,7 @@ async function readActivity(ctx, sessionId) {
 }
 
 async function deleteSession(ctx, sessionId) {
-  const report = { removed: [], workspaces: [], errors: [], warnings: [], archived: false }
+  const report = { removed: [], workspaces: [], errors: [], warnings: [], evicted: [] }
   if (!SAFE_SESSION_ID.test(sessionId)) {
     return { ok: false, error: `会话 id 不合法: ${sessionId}` }
   }
@@ -318,88 +374,131 @@ async function deleteSession(ctx, sessionId) {
 
   const home = dshHome()
   const dir = await locateSessionDir(home, sessionId)
-  if (dir === undefined) return await deleteWithoutLog(ctx, sessionId, report)
 
-  // Archive first. Detaching alone would only move the row out of its Workspace
-  // and into the Ungrouped bucket, because the Client's Session list still holds
-  // the Session while its Agent is live in this process; the archive set is what
-  // filters it out of every grouping surface.
-  await archiveForRemoval(ctx, sessionId, report)
-
-  // Then the disk: a failure here leaves the accounting whole, so nothing ends
-  // up half-deleted.
-  await removeSessionLog(home, sessionId, report)
-  await removeProjectionCache(home, sessionId, report)
-  if (report.errors.length > 0) {
-    return { ok: false, error: `删除会话文件失败：${report.errors.join('; ')}`, report }
+  // Permanent deletion — no archive step. Disk files go first: a failure here
+  // leaves the accounting whole, so nothing ends up half-deleted.
+  if (dir !== undefined) {
+    await removeSessionLog(home, sessionId, report)
+    await removeProjectionCache(home, sessionId, report)
+    if (report.errors.length > 0) {
+      return { ok: false, error: `删除会话文件失败：${report.errors.join('; ')}`, report }
+    }
   }
 
+  // Accounting: drop the id from every Workspace, clear archive/pin residue, and
+  // forget the header index so later existence checks agree with the disk.
   await detachFromWorkspaces(ctx.workspaceRegistry, sessionId, report)
   forgetHeaderIndex(ctx.workspaceRegistry, sessionId)
   if (report.errors.length > 0) {
     return { ok: false, error: `会话文件已删除，但侧栏条目更新失败：${report.errors.join('; ')}`, report }
   }
-  return { ok: true, report }
-}
 
-/**
- * Put the id in the registry's archive set, which is the only durable switch
- * that hides a Session from the default sidebar while it is still live in this
- * process. A Session that no longer exists anywhere cannot be archived, so a
- * failure is recorded as a warning and never blocks the delete.
- */
-async function archiveForRemoval(ctx, sessionId, report) {
-  const registry = ctx.workspaceRegistry
-  try {
-    if (!registry.archivedSessionIds.includes(sessionId)) {
-      await registry.archiveSession(sessionId, { stopActivity: true })
-    }
-    report.archived = true
-  } catch (error) {
-    report.warnings.push(`archive: ${error && error.message ? error.message : String(error)}`)
-  }
-}
+  // Evict the resident entries. `listSessions` prefers live records, so the row
+  // would otherwise survive the deleted log and reappear under Ungrouped once its
+  // Workspace accounting is gone. Evicting leaves nothing for the next start.
+  evictResident(ctx, sessionId, report)
 
-/**
- * A Session with no log directory has nothing to delete, and it shows up in the
- * sidebar's Ungrouped bucket because no Workspace accounts for it either. Two
- * shapes exist:
- *
- * - a live blank Session that was never written (created, never messaged). It
- *   lives only in this process, so no plugin can drop it from the store; the
- *   registry's archive set is the one durable switch that hides it from the
- *   default view, and a blank Session never persists, so a restart removes it.
- * - a stale search-index row whose log is already gone. Reconciling the index
- *   is enough: the next `listSessions` drops it.
- */
-async function deleteWithoutLog(ctx, sessionId, report) {
-  const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : undefined
-  const live = sessions && typeof sessions.get === 'function' ? sessions.get(sessionId) !== undefined : false
-
-  if (live) {
-    await archiveForRemoval(ctx, sessionId, report)
-    if (report.archived !== true) {
-      return { ok: false, error: `该会话没有日志文件，也无法从列表隐藏：${report.warnings.join('; ')}`, report }
-    }
-    return { ok: true, hidden: true, report }
-  }
-
+  // Reconcile the disposable search index so a deleted persisted Session drops
+  // out of `listSessions` on the next read instead of lingering as a cold row.
   try {
     const query = typeof ctx.get === 'function' ? ctx.get('sessionQuery') : undefined
     if (query && typeof query.listSessions === 'function') await query.listSessions()
   } catch {
-    /* the Client's own list call reconciles too */
+    /* the index reconciles on its own next read */
   }
-  return { ok: true, stale: true, report }
+
+  return { ok: true, report }
 }
 
 /**
- * Report the Sessions a user can actually see in the sidebar's Ungrouped bucket:
- * no Workspace accounts for them and they are not archived. Each entry carries
- * the facts that decide whether a delete can be seen — on disk, live in this
- * Host, and the cwd the row would open.
+ * Hide every Session in the sidebar's Ungrouped bucket.
+ *
+ * Ungrouped is not a stored place: it is what the sidebar shows for a Session no
+ * Workspace accounts for. Two repairs are possible, and re-homing is preferred
+ * because it keeps the Session usable and reachable:
+ *
+ *   1. **re-home** — a Workspace whose canonical path equals the Session's cwd
+ *      already owns that directory, so `attachSession` puts the row back where
+ *      it belongs. This covers the common case of a row that lost its
+ *      accounting entry.
+ *   2. **archive** — a Session with no matching Workspace (or none whose cwd can
+ *      be validated) is put in the registry's archive set, which filters it out
+ *      of every grouping surface without touching its log.
+ *
+ * Archiving needs the id to exist, so a Session that has vanished from both the
+ * store and persistence is skipped with a warning instead of failing the batch.
  */
-async function listStrays(ctx) {
+async function hideUngrouped(ctx) {
+  const registry = ctx.workspaceRegistry
+  const strays = await collectStrays(ctx)
+  const result = { ok: true, rehomed: [], archived: [], skipped: [], errors: [] }
+
+  const entities = registry && registry.entities ? [...registry.entities.values()] : []
+  const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : undefined
+
+  for (const stray of strays) {
+    const sessionId = stray.sessionId
+    const cwd = await resolveSessionCwd(ctx, sessionId)
+
+    let target
+    if (typeof cwd === 'string' && cwd.length > 0) {
+      const canonical = await canonicalDir(cwd)
+      if (canonical !== undefined) {
+        target = entities.find((entity) => entity && entity.record && entity.record.path === canonical)
+      }
+    }
+
+    if (target !== undefined) {
+      try {
+        await target.attachSession(sessionId)
+        result.rehomed.push({ sessionId, workspaceId: String(target.id) })
+        continue
+      } catch (error) {
+        result.errors.push(`re-home ${sessionId}: ${error && error.message ? error.message : String(error)}`)
+      }
+    }
+
+    const live = sessions && typeof sessions.get === 'function' ? sessions.get(sessionId) !== undefined : false
+    const onDisk = (await locateSessionDir(dshHome(), sessionId)) !== undefined
+    if (!live && !onDisk) {
+      result.skipped.push({ sessionId, reason: '会话已不存在于内存与磁盘，无法归档' })
+      continue
+    }
+
+    try {
+      if (!registry.archivedSessionIds.includes(sessionId)) {
+        await registry.archiveSession(sessionId, { stopActivity: true })
+      }
+      result.archived.push(sessionId)
+    } catch (error) {
+      result.errors.push(`archive ${sessionId}: ${error && error.message ? error.message : String(error)}`)
+    }
+  }
+
+  result.remaining = (await collectStrays(ctx)).map((entry) => entry.sessionId)
+  result.ok = result.errors.length === 0
+  return result
+}
+
+/** Canonical directory for `path`, or `undefined` when it is not a directory. */
+async function canonicalDir(path) {
+  try {
+    const info = await stat(path)
+    if (!info.isDirectory()) return undefined
+  } catch {
+    return undefined
+  }
+  try {
+    // The registry stamps its records with an `fs.realpath` canon, so a match
+    // must compare the same spelling.
+    return await realpath(path)
+  } catch {
+    return undefined
+  }
+}
+
+/** Sessions the sidebar shows under Ungrouped: unaccounted for and not archived. */
+async function collectStrays(ctx) {
   const registry = ctx.workspaceRegistry
   const accounted = new Set()
   const entities = registry && registry.entities
@@ -415,14 +514,9 @@ async function listStrays(ctx) {
   const sessions = typeof ctx.get === 'function' ? ctx.get('sessions') : undefined
   const home = dshHome()
   const strays = []
-  let hidden = 0
   for (const record of records) {
     const sessionId = record && record.header ? record.header.id : record && record.sessionId
-    if (typeof sessionId !== 'string' || accounted.has(sessionId)) continue
-    if (archived.has(sessionId)) {
-      hidden += 1
-      continue
-    }
+    if (typeof sessionId !== 'string' || accounted.has(sessionId) || archived.has(sessionId)) continue
     strays.push({
       sessionId,
       live: sessions && typeof sessions.get === 'function' ? sessions.get(sessionId) !== undefined : false,
@@ -431,11 +525,30 @@ async function listStrays(ctx) {
       createdAt: record && record.header ? record.header.createdAt : undefined,
     })
   }
+  return strays
+}
+
+/**
+ * Report the Sessions a user can actually see in the sidebar's Ungrouped bucket:
+ * no Workspace accounts for them and they are not archived. Each entry carries
+ * the facts that decide whether a delete can be seen — on disk, live in this
+ * Host, and the cwd the row would open.
+ */
+async function listStrays(ctx) {
+  const registry = ctx.workspaceRegistry
+  const strays = await collectStrays(ctx)
+  const archival = Array.isArray(registry && registry.archivedSessionIds) ? registry.archivedSessionIds.length : 0
+  const accounted = new Set()
+  const entities = registry && registry.entities
+  if (entities && typeof entities.values === 'function') {
+    for (const entity of entities.values()) {
+      for (const id of entity.record ? entity.record.sessionIds : []) accounted.add(id)
+    }
+  }
   return {
     ok: true,
-    indexed: records.length,
     accounted: accounted.size,
-    archivedHidden: hidden,
+    archivedHidden: archival,
     strays,
   }
 }
@@ -472,6 +585,11 @@ export function apply(ctx) {
         }
         if (request.op === 'strays') {
           sendJson(res, 200, await listStrays(ctx))
+          return
+        }
+        if (request.op === 'hide-ungrouped') {
+          const result = await hideUngrouped(ctx)
+          sendJson(res, result.ok ? 200 : 500, result)
           return
         }
         if (request.op === 'reveal') {
