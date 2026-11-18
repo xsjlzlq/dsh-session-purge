@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Session Right-Click Delete",
-    "description": "Right-click a session in the sidebar to delete its log, projection cache and workspace entry for good."
+    "description": "Right-click a session in the sidebar to delete its log, projection cache and workspace entry for good, open its working directory, or hide every ungrouped session at once."
   }
 }
